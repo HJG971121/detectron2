@@ -2,10 +2,6 @@ import inplace_abn
 from torch import nn
 import torch
 import math
-from ..backbone.unet_transfomer_backbone import (
-                                PositionalEncodingPermute2D,
-                                MultiHeadDense,
-                                MultiHeadAttention)
 
 abn_blocks = {
     0: inplace_abn.ABN,
@@ -94,7 +90,7 @@ class Conv2dABN(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-        # x = self.abn(x)
+        x = self.abn(x)
         return x
 
 class Padding2Even(nn.Module):
@@ -162,120 +158,3 @@ class CBAMLayer(nn.Module):
         self.channel_out = channel_out
         self.spatial_out = spatial_out
         return x
-
-# Convolutional Block Attention Module Revision
-class CBAMRLayer(nn.Module):
-    def __init__(self, channel, reduction=16, spatial_kernel=7):
-        super(CBAMRLayer, self).__init__()
-
-        # channel attention 压缩H,W为1
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-
-        # shared MLP
-        self.mlp = nn.Sequential(
-            # Conv2d比Linear方便操作
-            # nn.Linear(channel, channel // reduction, bias=False)
-            nn.Conv2d(channel, channel // reduction, 1, bias=False),
-            # inplace=True直接替换，节省内存
-            nn.ReLU(inplace=True),
-            # nn.Linear(channel // reduction, channel,bias=False)
-            nn.Conv2d(channel // reduction, channel, 1, bias=False)
-        )
-
-        # spatial attention
-        self.conv = nn.Conv2d(2, 1, kernel_size=spatial_kernel,
-                              padding=spatial_kernel // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        max_out = self.mlp(self.max_pool(x))
-        avg_out = self.mlp(self.avg_pool(x))
-        channel_out = self.sigmoid(max_out + avg_out)
-        y_channel = channel_out * x
-
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        spatial_out = self.sigmoid(self.conv(torch.cat([max_out, avg_out], dim=1)))
-        y_spatial = spatial_out * x
-
-        return (y_channel+y_spatial)/2
-
-
-class AttentionGate(nn.Module):
-    def __init__(self, channel_Y, channel_S):
-        super(AttentionGate, self).__init__()
-        self.W_Y = nn.Sequential(
-            nn.Conv2d(channel_Y, channel_Y, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(channel_Y)
-        )
-        self.W_S = nn.Sequential(
-            nn.Conv2d(channel_S, channel_Y, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(channel_Y)
-        )
-        self.psi = nn.Sequential(
-            nn.Conv2d(channel_Y, 1, kernel_size=1, stride=1, padding=0, bias=False),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid()
-        )
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, Y, S):
-        Y1 = self.W_Y(Y)
-        S1 = self.W_S(S)
-        psi = self.relu(Y1+S1)
-        psi = self.psi(psi)
-        return S*psi
-
-class MultiHeadCrossAttention(MultiHeadAttention):
-    def __init__(self, channelY, channelS):
-        super(MultiHeadCrossAttention, self).__init__()
-        self.Sconv = nn.Sequential(
-            Conv2dABN(in_channel=channelS,
-                      out_channel=channelS,
-                      kernel_size=1,
-                      ))
-        self.Yconv =Conv2dABN(in_channel=channelY,
-                    out_channel=channelS,
-                    kernel_size=1,
-                    )
-        self.query = MultiHeadDense(channelS, bias=False)
-        self.key = MultiHeadDense(channelS, bias=False)
-        self.value = MultiHeadDense(channelS, bias=False)
-        self.conv = Conv2dABN(in_channel=channelS,
-                      out_channel=channelS,
-                      kernel_size=1)
-        self.Yconv2 = nn.Sequential(
-            Conv2dABN(in_channel=channelY, out_channel=channelS, kernel_size=1))
-        self.softmax = nn.Softmax(dim=1)
-        self.Spe = PositionalEncodingPermute2D(channelS)
-        self.Ype = PositionalEncodingPermute2D(channelY)
-
-    def forward(self, Y, S):
-        Sb, Sc, Sh, Sw = S.size()
-        Yb, Yc, Yh, Yw = Y.size()
-
-        # Skip connection S
-        # Spe = self.positional_encoding_2d(Sc, Sh, Sw)
-        Spe = self.Spe(S)
-        S = S + Spe
-        S1 = self.Sconv(S).reshape(Yb, Sc, Yh * Yw).permute(0, 2, 1)
-        V = self.value(S1)
-        del Spe, S1
-
-        # hight level feature map Y
-        # Ype = self.positional_encoding_2d(Yc, Yh, Yw)
-        Ype = self.Ype(Y)
-        Y = Y + Ype
-        Y1 = self.Yconv(Y).reshape(Yb, Sc, Yh * Yw).permute(0, 2, 1)
-        Y2 = self.Yconv2(Y)
-        Q = self.query(Y1)
-        K = self.key(Y1)
-        del Ype, Y1
-
-        A = self.softmax(torch.bmm(Q, K.permute(0, 2, 1)) / math.sqrt(Sc))
-        x = torch.bmm(A, V).permute(0, 2, 1).reshape(Yb, Sc, Yh, Yw)
-        Z = self.conv(x)
-        Z = Z * S
-        Z = torch.cat([Z, Y2], dim=1)
-        return Z

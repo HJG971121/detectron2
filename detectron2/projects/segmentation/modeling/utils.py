@@ -49,10 +49,8 @@ def build_dense_layer(input_channel,
         else:
             kernel_size = 3
     pad = (kernel_size-1) // 2
-    # growth_rate = int(input_channel/num_layer)
 
     layers = []
-    # layers.append(nn.Conv2d(in_channels=input_channel, out_channels=input_channel,kernel_size=1))
     for i in range(num_layer):
         layers.append(
             DenseABN(
@@ -61,5 +59,4 @@ def build_dense_layer(input_channel,
                 stride,
                 abn=abn
             ))
-    # layers.append(nn.Conv2d(in_channels=input_channel+num_layer*growth_rate, out_channels=output_channel, kernel_size=1))
     return nn.Sequential(*layers)
