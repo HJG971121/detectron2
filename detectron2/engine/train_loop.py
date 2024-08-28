@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import time
 import weakref
+import copy
 from typing import List, Mapping, Optional
 import torch
 from torch.nn.parallel import DataParallel, DistributedDataParallel
@@ -12,8 +13,15 @@ from torch.nn.parallel import DataParallel, DistributedDataParallel
 import detectron2.utils.comm as comm
 from detectron2.utils.events import EventStorage, get_event_storage
 from detectron2.utils.logger import _log_api_usage
+from detectron2.config import instantiate
+from detectron2.projects.segmentation.data import build_train_loader, build_test_loader
+from detectron2.evaluation import print_csv_format
+from detectron2.projects.segmentation.evaluation import inference_on_dataset
 
-__all__ = ["HookBase", "TrainerBase", "SimpleTrainer", "AMPTrainer"]
+
+
+
+__all__ = ["HookBase", "TrainerBase", "SimpleTrainer", "AMPTrainer", "AMPTrainerKfold"]
 
 
 class HookBase:
@@ -540,3 +548,181 @@ class AMPTrainer(SimpleTrainer):
     def load_state_dict(self, state_dict):
         super().load_state_dict(state_dict)
         self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
+
+
+
+class AMPTrainerKfold(SimpleTrainer):
+    """
+    Like :class:`SimpleTrainer`, but uses PyTorch's native automatic mixed precision
+    in the training loop.
+    """
+
+    def __init__(
+        self,
+        model,
+        data_loader,
+        optimizer,
+        gather_metric_period=1,
+        zero_grad_before_forward=False,
+        grad_scaler=None,
+        precision: torch.dtype = torch.float16,
+        log_grad_scaler: bool = False,
+        async_write_metrics=False,
+        grad_clipper = None,
+        dataset = None,
+        cfg = None,
+        train_k_list = [],
+        val_k_list = []
+    ):
+        """
+        Args:
+            model, data_loader, optimizer, gather_metric_period, zero_grad_before_forward,
+                async_write_metrics: same as in :class:`SimpleTrainer`.
+            grad_scaler: torch GradScaler to automatically scale gradients.
+            precision: torch.dtype as the target precision to cast to in computations
+        """
+        unsupported = "AMPTrainer does not support single-process multi-device training!"
+        if isinstance(model, DistributedDataParallel):
+            assert not (model.device_ids and len(model.device_ids) > 1), unsupported
+        assert not isinstance(model, DataParallel), unsupported
+
+        super().__init__(
+            model, data_loader, optimizer, gather_metric_period, zero_grad_before_forward
+        )
+
+        if grad_scaler is None:
+            from torch.cuda.amp import GradScaler
+
+            grad_scaler = GradScaler()
+        self.grad_scaler = grad_scaler
+        self.precision = precision
+        self.log_grad_scaler = log_grad_scaler
+        self.grad_clipper = grad_clipper
+
+        self.dataset = dataset
+        self.cfg = cfg
+        self.reset_period = cfg.train.epoch_iters
+        self.kfold = cfg.train.k_fold
+        self.train_k_list = train_k_list
+        self.val_k_list = val_k_list
+        self.idx = 0
+
+    def reset_data_loader(self):
+        del self.data_loader
+        del self._data_loader_iter_obj
+
+        # train
+        self.dataset.data_list = self.train_k_list[self.idx % self.kfold]
+        train_loader = build_train_loader(dataset=self.dataset,
+                                               mapper=instantiate(self.cfg.dataloader.train.mapper),
+                                               batch_size=self.cfg.dataloader.train.batch_size,
+                                               num_workers=self.cfg.dataloader.train.num_workers)
+        # valid
+        val_dataset = copy.deepcopy(self.dataset)
+        val_dataset.data_list = self.val_k_list[self.idx % self.kfold]
+        self.val_loader = build_test_loader(dataset=val_dataset,
+                                            mapper=instantiate(self.cfg.dataloader.test.mapper),
+                                            batch_size=self.cfg.dataloader.test.batch_size,
+                                            num_workers=self.cfg.dataloader.test.num_workers)
+
+        self.data_loader = train_loader
+        self._data_loader_iter_obj = None
+
+    def before_step(self):
+        # Maintain the invariant that storage.iter == trainer.iter
+        # for the entire execution of each step
+        self.storage.iter = self.iter
+
+        for h in self._hooks:
+            h.before_step()
+
+
+        if self.reset_period > 0 and self.iter % self.reset_period == 0:
+            self.reset_data_loader()
+            self.idx += 1
+    def run_step(self):
+        """
+        Implement the AMP training logic.
+        """
+        assert self.model.training, "[AMPTrainer] model was changed to eval mode!"
+        assert torch.cuda.is_available(), "[AMPTrainer] CUDA is required for AMP training!"
+        from torch.cuda.amp import autocast
+
+        start = time.perf_counter()
+        data = next(self._data_loader_iter)
+        data_time = time.perf_counter() - start
+
+        if self.zero_grad_before_forward:
+            self.optimizer.zero_grad()
+        with autocast(dtype=self.precision):
+            loss_dict = self.model(data)
+            if isinstance(loss_dict, torch.Tensor):
+                losses = loss_dict
+                loss_dict = {"total_loss": loss_dict}
+            else:
+                losses = loss_dict['total_loss']
+
+        if not self.zero_grad_before_forward:
+            self.optimizer.zero_grad()
+
+        self.grad_scaler.scale(losses).backward()
+        if self.grad_clipper is not None:
+            self.grad_scaler.unscale_(self.optimizer)
+            self.grad_clipper(self.model.parameters())
+
+        if self.log_grad_scaler:
+            storage = get_event_storage()
+            storage.put_scalar("[metric]grad_scaler_", self.grad_scaler.get_scale())
+
+        self.after_backward()
+
+        if self.async_write_metrics:
+            # write metrics asynchronically
+            self.concurrent_executor.submit(
+                self._write_metrics, loss_dict, data_time, iter=self.iter
+            )
+        else:
+            self._write_metrics(loss_dict, data_time)
+
+        self.grad_scaler.step(self.optimizer)
+        self.grad_scaler.update()
+    def after_step(self):
+        for h in self._hooks:
+            h.after_step()
+
+        if self.iter % self.reset_period == 0:
+            if self.idx % self.kfold == 1:
+                self.ret_kfold = self.do_valid()
+            else:
+                ret = self.do_valid()
+                for evaluater, dic in ret.items():
+                    for k, v in dic.items():
+                        self.ret_kfold[evaluater][k] += v
+
+            if self.idx % self.kfold == 0:
+                for evaluater, dic in self.ret_kfold.items():
+                    for k, v in dic.items():
+                        self.ret_kfold[evaluater][k] = v/self.kfold
+                print_csv_format(self.ret_kfold)
+    def do_valid(self):
+        if "evaluator" in self.cfg.dataloader:
+            if self.cfg.train.split_combine.enabled:
+                from detectron2.projects.segmentation.transforms.split_combine import SplitCombineModelWrapper
+                model = SplitCombineModelWrapper(self.model,
+                                                 instantiate(self.cfg.train.split_combine.split_combiner),
+                                                 batch_size=self.cfg.dataloader.test.batch_size)
+
+            ret = inference_on_dataset(
+                model, self.val_loader, instantiate(self.cfg.dataloader.evaluator)
+            )
+
+            return ret
+    def state_dict(self):
+        ret = super().state_dict()
+        ret["grad_scaler"] = self.grad_scaler.state_dict()
+        return ret
+    def load_state_dict(self, state_dict):
+        super().load_state_dict(state_dict)
+        self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
+
+
