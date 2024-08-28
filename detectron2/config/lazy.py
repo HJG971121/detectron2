@@ -73,7 +73,7 @@ def _visit_dict_config(cfg, func):
 
 def _validate_py_syntax(filename):
     # see also https://github.com/open-mmlab/mmcv/blob/master/mmcv/utils/config.py
-    with PathManager.open(filename, "r") as f:
+    with PathManager.open(filename, "r", encoding = 'mac_roman') as f:
         content = f.read()
     try:
         ast.parse(content)
@@ -157,7 +157,7 @@ Within a config file, relative import can only import other config files.
             )
             module = importlib.util.module_from_spec(spec)
             module.__file__ = cur_file
-            with PathManager.open(cur_file) as f:
+            with PathManager.open(cur_file, 'rb') as f:
                 content = f.read()
             exec(compile(content, cur_file, "exec"), module.__dict__)
             for name in fromlist:  # turn imported dict into DictConfig automatically
@@ -216,7 +216,7 @@ class LazyConfig:
                     "__file__": filename,
                     "__package__": _random_package_name(filename),
                 }
-                with PathManager.open(filename) as f:
+                with PathManager.open(filename, 'rb') as f:
                     content = f.read()
                 # Compile first with filename to:
                 # 1. make filename appears in stacktrace

@@ -223,7 +223,7 @@ def default_setup(cfg, args):
         logger.info(
             "Contents of args.config_file={}:\n{}".format(
                 args.config_file,
-                _highlight(PathManager.open(args.config_file, "r").read(), args.config_file),
+                _highlight(PathManager.open(args.config_file, "r", encoding='UTF-8').read(), args.config_file),
             )
         )
 
