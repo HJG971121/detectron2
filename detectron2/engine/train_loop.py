@@ -385,7 +385,13 @@ class SimpleTrainer(TrainerBase):
             data_time (float): time taken by the dataloader iteration
             prefix (str): prefix for logging keys
         """
-        metrics_dict = {k: v.detach().cpu().item() for k, v in loss_dict.items()}
+        metrics_dict = {}
+        for k, v in loss_dict.items():
+            if isinstance(v, list):
+                for idx, loss in enumerate(v):
+                    metrics_dict[f'{k}_{len(v) - idx - 1}'] = loss.detach().cpu().item()
+            else:
+                metrics_dict[k] = v.detach().cpu().item()
         metrics_dict["data_time"] = data_time
 
         storage = get_event_storage()
@@ -451,6 +457,7 @@ class AMPTrainer(SimpleTrainer):
         precision: torch.dtype = torch.float16,
         log_grad_scaler: bool = False,
         async_write_metrics=False,
+        grad_clipper=None,
     ):
         """
         Args:
@@ -475,6 +482,7 @@ class AMPTrainer(SimpleTrainer):
         self.grad_scaler = grad_scaler
         self.precision = precision
         self.log_grad_scaler = log_grad_scaler
+        self.grad_clipper = grad_clipper
 
     def run_step(self):
         """
@@ -496,12 +504,16 @@ class AMPTrainer(SimpleTrainer):
                 losses = loss_dict
                 loss_dict = {"total_loss": loss_dict}
             else:
-                losses = sum(loss_dict.values())
+                losses = loss_dict['total_loss']
 
         if not self.zero_grad_before_forward:
             self.optimizer.zero_grad()
 
         self.grad_scaler.scale(losses).backward()
+        if self.grad_clipper is not None:
+            self.grad_scaler.unscale_(self.optimizer)
+            self.grad_clipper(self.model.parameters())
+
 
         if self.log_grad_scaler:
             storage = get_event_storage()
